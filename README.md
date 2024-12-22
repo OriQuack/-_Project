@@ -8,6 +8,7 @@
 - **`get_raw_data.py`**: Fetches raw data from external sources.
 - **`process_data.py`**: Preprocesses raw data for training and evaluation.
 - **`add_tech.py`**: Adds technical indicators to the dataset.
+- **`hyper_tune.py`**: Tunes hyperparameter alpha.
 
 ### 2. `hyperparameter_tune`
 Contains scripts and plots for hyperparameter tuning:

@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 # ----------------------------
 # HYPERPARAMETERS
 # ----------------------------
-ALPHA = 0.001
-WEIGHT_EXP = 0.2
+ALPHA = 1
+WEIGHT_EXP = 3
 TRAIN_SIZE = 400
 DATE_FORMAT = "%Y-%m-%d"
 RANDOM_SEED = 1222
@@ -58,11 +58,9 @@ def fit_model(X, y, alpha=ALPHA):
     Fits a Ridge model with X, y.
     Returns the fitted model and the fitted scaler (for feature standardization).
     """
-    # 1) Scale data
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # 2) Fit Ridge
     model = Ridge(alpha=alpha, fit_intercept=True)
     model.fit(X_scaled, y)
     return model, scaler
@@ -77,73 +75,105 @@ def predict_with_model(model, scaler, feats):
 
 
 # ----------------------------
-# 4) MAIN LOOP TO PREDICT 8/19 to 8/23
+# 4) TRAIN MODELS PER LAG USING TRAINING DATA EXCLUDING TARGET DATES
 # ----------------------------
-prediction_days = pd.to_datetime(
+
+# Define target prediction dates
+target_dates = pd.to_datetime(
     ["2024-08-19", "2024-08-20", "2024-08-21", "2024-08-22", "2024-08-23"]
 )
 
-results = []
-for target_day in prediction_days:
-    # 4a) Build training data and fit 5 models
-    models_and_scalers = []
-    for i in range(1, 6):
-        day_i = target_day - pd.Timedelta(days=i)
-        X_train = []
-        y_train = []
+# Define training data as all dates not in target_dates
+training_data = df[~df["Date"].isin(target_dates)]
 
-        for tk in train_tickers:
-            subdf = df[df["Ticker"] == tk]
+# Initialize dictionary to store models and scalers per lag
+models_dict = {}  # lag -> (model, scaler)
+
+# Train a separate model for each lag using all available training data
+for i in range(1, 6):
+    X_train = []
+    y_train = []
+
+    for tk in train_tickers:
+        subdf = training_data[training_data["Ticker"] == tk]
+        # Iterate over all possible target_days in training_data that have at least i days before
+        for idx in range(i, len(subdf)):
+            day_i = subdf.iloc[idx - i]["Date"]
+            target_day = subdf.iloc[idx]["Date"]
             feats = get_features_for_day(subdf, day_i)
             if feats is None:
                 continue
-
-            row_target = subdf.loc[subdf["Date"] == target_day]
-            if row_target.empty:
-                continue
-            close_val = row_target["Close"].values[0]
-
+            close_val = subdf.iloc[idx]["Close"]
             X_train.append(feats)
             y_train.append(close_val)
 
-        X_train = np.array(X_train)
-        y_train = np.array(y_train)
+    X_train = np.array(X_train)
+    y_train = np.array(y_train)
 
-        if len(X_train) > 0:
-            model_i, scaler_i = fit_model(X_train, y_train, alpha=ALPHA)
-            models_and_scalers.append((model_i, scaler_i))
-        else:
-            models_and_scalers.append((None, None))
+    if len(X_train) > 0:
+        model_i, scaler_i = fit_model(X_train, y_train, alpha=ALPHA)
+        models_dict[i] = (model_i, scaler_i)
+    else:
+        models_dict[i] = (None, None)
 
-    # 4b) Predict on TEST set with exponential weighting
+# ----------------------------
+# 5) PREDICT ON TARGET DATES USING TEST TICKERS
+# ----------------------------
+
+results = []
+prev_predictions = {}  # (ticker, previous_day) -> predicted close
+
+# Sort the target_dates in chronological order
+prediction_days = sorted(target_dates)
+
+for target_day in prediction_days:
     for tk in test_tickers:
         subdf = df[df["Ticker"] == tk]
 
         preds = []
         weights = []
+
         for i in range(1, 6):
-            model_i, scaler_i = models_and_scalers[i - 1]
-            if model_i is None:
-                continue
-
-            day_i = target_day - pd.Timedelta(days=i)
-            feats = get_features_for_day(subdf, day_i)
-            if feats is None:
-                continue
-
-            pred_val = predict_with_model(model_i, scaler_i, feats)
-            w_i = np.exp(-i * WEIGHT_EXP)
-            preds.append(pred_val * w_i)
-            weights.append(w_i)
+            model_i, scaler_i = models_dict.get(i, (None, None))
+            if model_i is not None:
+                day_i = target_day - pd.Timedelta(days=i)
+                feats = get_features_for_day(subdf, day_i)
+                if feats is not None:
+                    # Predict using the trained model
+                    pred_val = predict_with_model(model_i, scaler_i, feats)
+                    w_i = np.exp(-i * WEIGHT_EXP)
+                    preds.append(pred_val * w_i)
+                    weights.append(w_i)
+                else:
+                    # Features missing, use fallback
+                    fallback_day = target_day - pd.Timedelta(days=1)
+                    fallback_pred = prev_predictions.get((tk, fallback_day))
+                    if fallback_pred is not None:
+                        w_i = np.exp(-i * WEIGHT_EXP)
+                        preds.append(fallback_pred * w_i)
+                        weights.append(w_i)
+            else:
+                # Model is None, use fallback
+                fallback_day = target_day - pd.Timedelta(days=1)
+                fallback_pred = prev_predictions.get((tk, fallback_day))
+                if fallback_pred is not None:
+                    w_i = np.exp(-i * WEIGHT_EXP)
+                    preds.append(fallback_pred * w_i)
+                    weights.append(w_i)
 
         if len(preds) == 0:
+            # No predictions available; skip
             continue
 
+        # Final predicted close price with exponential weighting
         final_pred = sum(preds) / sum(weights)
         results.append({"Ticker": tk, "Date": target_day, "Pred_Close": final_pred})
 
+        # Store the prediction for potential fallback in subsequent predictions
+        prev_predictions[(tk, target_day)] = final_pred
+
 # ----------------------------
-# 5) COLLECT RESULTS AND CALCULATE MSE
+# 6) COLLECT RESULTS AND CALCULATE MSE
 # ----------------------------
 pred_df = (
     pd.DataFrame(results).sort_values(by=["Ticker", "Date"]).reset_index(drop=True)
@@ -187,18 +217,17 @@ for bar in bars:
         va="bottom",
     )
 
-plt.title("Mean Squared Error (MSE) per Date and Overall (Model 2)")
+plt.title("Mean Squared Error (MSE) per Date and Overall")
 plt.xlabel("Date")
 plt.ylabel("Mean Squared Error")
 plt.xticks(mse_per_date.index, ["8/19", "8/20", "8/21", "8/22", "8/23"], rotation=45)
 plt.legend()
 plt.tight_layout()
 plt.savefig("./model2/model2-mse.png")
-plt.show()
 
 
 # ----------------------------
-# 6) VISUALIZATION (Optional)
+# 7) VISUALIZATION (Optional)
 # ----------------------------
 plt.figure(figsize=(20, 8))
 latest_predictions = merged_df.groupby("Ticker").last().reset_index()
@@ -222,7 +251,7 @@ plt.tight_layout()
 plt.savefig("./model2/model2.png")
 
 # ----------------------------
-# 7) FIND BEST AND WORST PREDICTIONS
+# 8) FIND BEST AND WORST PREDICTIONS
 # ----------------------------
 merged_df["Proportional_Error"] = abs(
     (merged_df["Actual_Close"] - merged_df["Pred_Close"]) / merged_df["Actual_Close"]
